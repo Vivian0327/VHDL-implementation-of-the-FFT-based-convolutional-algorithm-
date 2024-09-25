@@ -1,0 +1,414 @@
+---------------------------------------------------------------------------------
+-- Project Title : 2D FFT-based convolution
+-- Author        : Weiwei Wang
+-- Create Date   : 03/25/2024
+-- Description   : THis designe is 2D FFT based convolution 
+---------------------------------------------------------------------------------
+library work;
+use work.FFT2D_package.all;
+
+--LIBRARY work;
+--USE work.n_bits_int.ALL;
+
+library ieee;
+use ieee.std_logic_1164.all;   use ieee.std_logic_arith.all;
+use ieee.std_logic_signed.all; use ieee.std_logic_unsigned.all;
+
+package FFT2Cov_package is           -- User defined type
+	CONSTANT W,H :INTEGER := 12;     -- Input image size 12*12
+	CONSTANT J   :INTEGER := 6;      -- Split widths and heigh of input image into 6-point length subsequence
+	CONSTANT M   :INTEGER := 2;      -- W/J =H/J = 2
+	CONSTANT K   :INTEGER := 8;		 -- Short DFT length, should be 2^n
+	CONSTANT krl :INTEGER := 3;      -- Kernel Size 3*3
+	
+	SUBTYPE U9 IS INTEGER RANGE 0 TO 2**9-1;
+	SUBTYPE S16 IS INTEGER RANGE -2**15 TO 2**15-1;
+	SUBTYPE S20 IS INTEGER RANGE -524288 TO 524287;      	-- for Convolutional kernel
+	SUBTYPE S32 IS INTEGER RANGE -2147483647 TO 2147483647;
+	
+	TYPE array_In  IS ARRAY (0 TO K*M-1,0 TO K*M-1)      OF S20;--S16; 	-- Register for DHT
+	TYPE array_DHT  IS ARRAY (0 TO K*M-1,0 TO K*M-1)     OF S32; 	-- Register for DHT
+	TYPE array_IDHT IS ARRAY (0 TO K*M-1, 0 TO K*M-1)    OF S32;	-- Register for IDHT
+	TYPE array_seg  IS ARRAY (0 TO K-1,0 TO K-1)	        OF S32; 	-- Segments
+	TYPE array_conv IS ARRAY (0 TO W+krl-2,0 TO W+krl-2) OF S32; 	-- Register for convolution output
+	
+	type krl_memory    is array (0 to krl-1, 0 to krl-1) of INTEGER;
+	TYPE matrix_memory is array (0 to K-1, 0 to K-1)     of INTEGER;
+
+	TYPE states IS (start, load, mtxC1,mtxR1, DHT1, DHT2, MUL, IDHT1, IDHT2, mtxC2,mtxR2, overlap, done);
+	
+	COMPONENT FFT2D 					-- Forward transform
+	port(
+			clk:	   IN STD_LOGIC;		-- Clock cycle
+			rst_f2:  IN STD_LOGIC;		-- Reset
+			xr,xi:   In S20;				-- S16;				-- input x 
+			IDFT_sel:In STD_LOGIC;
+			FFT2D_valid: out std_logic;
+			fft2r,fft2i: out S20--S16
+	);        
+	END COMPONENT;
+	
+	/*COMPONENT IFFT2D 					-- Inverse transform
+	port(
+			clk:				IN STD_LOGIC;		-- Clock cycle
+			rst:   			IN STD_LOGIC;		-- Reset
+			xr,xi:   		In S16;				-- input x 
+			IFFT2D_valid: 	out std_logic;
+			ifft2r,ifft2i: out S16
+	);
+	END COMPONENT;*/
+end DHT2Cov_package;
+
+library work;
+use work.FFT2D_package.all;
+
+library work;
+use work.FFT2Cov_package.all;
+
+library ieee;
+use ieee.std_logic_1164.all;   use ieee.std_logic_arith.all;
+use ieee.std_logic_signed.all; use ieee.std_logic_unsigned.all;
+USE ieee.math_real.ALL;
+
+
+entity FFT2Conv is
+	port(
+			clk, rst : In  std_logic;
+			xr    	  : In  S20;--S16;			   -- Input
+			xi			  : In  S20;--S16;
+			DHTconv_valid: out std_logic;
+			Covr_out   : Out S32;			   -- Output
+			Covi_out   : out S32			  		-- Output
+		
+	);
+end entity;
+
+architecture FFT2_fpga of FFT2Conv is
+------------------Regular Paremeters-----------------------
+	SIGNAL state: states;						-- State of system
+	SIGNAL rst_fw: STD_LOGIC;
+	--SIGNAL rst_bw: STD_LOGIC;
+	SIGNAL fft2_valid: STD_LOGIC;				-- fft2d output is ready
+	--SIGNAL ifft2d_valid:STD_LOGIC;				--ifft2d output is ready
+	--SIGNAL sub_image  : array_seg;            -- subblock memory (K*K)
+	
+	SIGNAL blockr,blocki:S20;--S16;							-- FFT2D input
+	SIGNAL reg_xr, reg_xi: array_In;
+	SIGNAL DHT_xr,DHT_xi: array_DHT;				 -- Reg for  DHT result of the input image x
+	SIGNAL reg_DHTr, reg_DHTi:   		array_DHT;  -- Reg for DHT multiplication result
+	SIGNAL reg_reoder_r,reg_reoder_i:array_DHT;	--Reg for reordered result
+	SIGNAL reg_subout_r, reg_subout_i: S20:= 0;--S16;   	-- Reg for sub FFT2D 
+	
+	SIGNAL IDHT_sel: STD_LOGIC;
+	SIGNAL reg_IDHTr, reg_IDHTi: 	array_IDHT;  -- Reg for IDHT result
+	SIGNAL reg_ovlpr, reg_ovlpi: 	array_conv;  -- Reg for IDHT result
+ 
+-----------------------Input image x-------------------------
+	
+	/*constant x_imge  : array_DHT  := (
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(0 0 0 0 0 0 0 0 0 0 0 0  0  0  0 0),
+				(0 0 0 0 0 0 0 0 0 0 0 0  0  0  0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(1 2 3 4 5 6 0 0 7 8 9 10 11 12 0 0),
+				(0 0 0 0 0 0 0 0 0 0 0 0  0  0  0 0),
+				(0 0 0 0 0 0 0 0 0 0 0 0  0  0  0 0));
+*/
+--------------------------Filter-----------------------------
+	constant krnl: krl_memory := (
+				 (1, 2, 1),
+				 (2, 1, 2),
+				 (1, 2, 1));
+				 
+	constant DHT_kernelr: array_DHT := (
+				(65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536),
+				(65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536),
+				(39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554),
+				(39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(-6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786),
+				(-6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(-6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786),
+				(-6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786, -6786,	-6786, -6786),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(  0	,   0	 ,   0  , 	0  ,   0  ,   0  ,   0	,   0	 ,   0  ,   0  , 	 0  ,	  0  ,   0	,   0  , 	0 ,	0  ),
+				(39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554),
+				(39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554, 39554));
+	
+	constant DHT_kerneli: array_DHT := (
+				(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+				(-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47,-47),
+				(-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77,-77),
+				(-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82,-82),
+				(-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64,-64),
+				(-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37,-37),
+				(-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13,-13),
+				(-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2),
+				(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0),
+				(2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2),
+				(13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13),
+				(37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37),
+				(64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64),
+				(82,82,82,82,82,82,82,82,82,82,82,82,82,82,82,82),
+				(77,77,77,77,77,77,77,77,77,77,77,77,77,77,77,77),
+				(47,47,47,47,47,47,47,47,47,47,47,47,47,47,47,47));
+
+begin
+	PROCESS(clk, rst)
+		VARIABLE lr, lc,i,j: U9;
+		VARIABLE reg_convr, reg_convi: matrix_memory;	-- Reg for convolution result
+		VARIABLE add_total, mul_total,  mul_total2, acc_total: S32;
+	BEGIN
+	IF rst = '1' THEN 
+		reg_xr<= (OTHERS => (others =>0));			reg_xi<= (OTHERS => (others =>0));
+		DHT_xr<= (OTHERS => (others =>0));			DHT_xi<= (OTHERS => (others =>0));
+		reg_DHTr <= (OTHERS => (others =>0));		reg_DHTi<=(OTHERS => (others =>0));
+		reg_reoder_r <= (OTHERS => (others =>0));	reg_reoder_i <= (OTHERS => (others =>0));
+		reg_IDHTr <= (OTHERS => (others =>0));		reg_IDHTi <= (OTHERS => (others =>0));
+		reg_ovlpr <= (OTHERS => (others =>0));		reg_ovlpi <= (OTHERS => (others =>0));
+		rst_fw <= '1';
+		--rst_bw <= '1';
+		IDHT_sel <= '0';
+		state <= start;
+	ELSIF rising_edge(clk) THEN
+		CASE state IS
+			WHEN start =>
+				lr := 0; lc := 0;
+				i := 0;  j := 0;		
+				DHTconv_valid <= '0';
+				state <= load;
+			--------------------------------
+			WHEN load =>
+				if lr < M*K-1 then
+					if lc < M*K-1 then
+						reg_xr(lr,lc) <= xr;
+						reg_xi(lr,lc) <= xi;
+						lc := lc + 1;
+					else	
+						lc := 0;
+						lr:= lr + 1;
+					end if;
+				else	
+					lr := 0;
+					state <= DHT1;
+				end if;
+						
+			--------------------------------
+			WHEN DHT1 =>									--load dada to FFT2D(subimage FFT)
+				if rst_fw = '1' THEN
+					rst_fw <= '0';
+				else	
+					if lr < K then
+						if lc < K then
+							blockr <= reg_xr(i*K+lr,j*K+lc); 
+							blocki <= reg_xi(i*K+lr,j*K+lc);					-- input data did not have imgine part
+							lc := lc + 1;
+							if lc = K then
+								--state <= DHT2;
+								lc := 0;
+								lr := lr +1;
+								if lr = K then
+									lr := 0;
+									state <= DHT2;
+								end if;
+							end if;
+						end if;
+					end if;
+				end if;
+			--------------------------------
+			when DHT2 =>									-- calculate FFT2D
+				if fft2_valid = '1' then
+					if lr < K then	
+						if lc < K then     	-- if define a new variable, can pipelining. using "col" just used to simple
+							DHT_xr(i*K+lr,j*K+lc) <= reg_subout_r;
+							DHT_xi(i*K+lr,j*K+lc) <= reg_subout_i;
+							lc := lc+1;
+							
+							if lc = K then		-- one subblock DHT is done,continue the next row
+								lc := 0;
+								lr := lr +1;
+								if lr = K then  -- All subblock DHT are done
+									state <= DHT1;
+									lr := 0;
+									if i = 0 and j = 0 then		--the first sub image
+										j := j+1;
+									elsif i =0 and j = 1 then	--the second sub image
+										i := i + 1;
+										j := 0;
+									elsif i =1 and j =0 then	--the third sub image
+										j := j+1;
+									else								--the fourth sub image
+										i := 0; j := 0;
+										state <= mtxC1 ;			-- To do the first time reorder
+										rst_fw <= '1';          -- stop calling FFT2D
+									end if;
+								end if;
+							end if;
+						end if;
+					end if;
+				end if;			
+			
+			--------------------------------
+			WHEN mtxC1 =>
+				------Reoreder the  subimages' DHT to get the input image DHT 
+				for i in 0 to M*K-1 loop							-- Column interpolate
+					for j in 0 to K-1 loop
+						reg_reoder_r(i,j*2) <= DHT_xr(i,j);  	-- reg_reorder_r can change to temp_reorder_r
+						reg_reoder_i(i,j*2) <= DHT_xi(i,j);
+						reg_reoder_r(i,j*2+1) <= DHT_xr(i,K+j);
+						reg_reoder_i(i,j*2+1) <= DHT_xi(i,K+j);
+					end loop;
+				end loop;
+				state <= mtxR1;
+			when mtxR1=>
+				for j in 0 to M*K-1 loop								-- Row interpolate
+					for i in 0 to K-1 loop
+						DHT_xr(i*2,j) <= reg_reoder_r(i,j);
+						DHT_xi(i*2,j) <= reg_reoder_i(i,j);
+						DHT_xr(i*2+1,j) <= reg_reoder_r(K+i,j);
+						DHT_xi(i*2+1,j) <= reg_reoder_i(K+i,j);
+					end loop;
+				end loop;
+				
+			/*
+				if i < M*K-1 loop								-- Column interpolate
+					if j < K-1 loop
+						reg_reoder_r(i,j*2) <= DHT_xr(i,j);  	-- reg_reorder_r can change to temp_reorder_r
+						reg_reoder_i(i,j*2) <= DHT_xi(i,j);
+						reg_reoder_r(i,j*2+1) <= DHT_xr(i,K+j);
+						reg_reoder_i(i,j*2+1) <= DHT_xi(i,K+j);
+					end loop;
+				end loop;
+				
+				for j in 0 to M*K-1 loop								-- Row interpolate
+					for i in 0 to K-1 loop
+						DHT_xr(i*2,j) <= reg_reoder_r(i,j);
+						DHT_xi(i*2,j) <= reg_reoder_i(i,j);
+						DHT_xr(i*2+1,j) <= reg_reoder_r(K+i,j);
+						DHT_xi(i*2+1,j) <= reg_reoder_i(K+i,j);
+					end loop;
+				end loop;
+			*/
+				state <= MUL;
+			--------------------------------
+			WHEN MUL =>
+				for i in 0 to M*K-1 loop
+					for j in 0 to M*K-1 loop
+						reg_DHTr(i,j) <= DHT_kernelr(i,j) * DHT_xr(i,j)/2**14;
+						reg_DHTi(i,j) <= DHT_kerneli(i,j) * DHT_xi(i,j)/2**14; 
+					end loop;
+				end loop;
+				state <= mtxC2;
+				--------------------------------
+			WHEN mtxC2 =>										--this step is the opposite operation of mtsR1
+				------Reoreder the DHT multiplication result to get the input if IDHT 
+				for i in 0 to M*K-1 loop								-- Column reorder
+					for j in 0 to K-1 loop
+						reg_reoder_r(i,j) <= reg_DHTr(i,j*2);  	-- reg_reorder_r can change to temp_reorder_r
+						reg_reoder_i(i,j) <= reg_DHTi(i,j*2);
+						reg_reoder_r(i,j+K) <= reg_DHTr(i,j*2+1);
+						reg_reoder_i(i,j+K) <= reg_DHTi(i,j*2+1);
+					end loop;
+				end loop;
+				state <= mtxR2;
+			--------------------------------
+			when mtxR2 =>	
+				for j in 0 to M*K-1 loop								-- Row reorder
+					for i in 0 to K-1 loop
+						DHT_xr(i,j) <= reg_reoder_r(i*2,j);
+						DHT_xi(i,j) <= reg_reoder_i(i*2,j);
+						DHT_xr(i+K,j) <= reg_reoder_r(i*2+1,j);
+						DHT_xi(i+K,j) <= reg_reoder_i(i*2+1,j);
+					end loop;
+				end loop;
+				state <= IDHT1;
+				IDHT_sel <= '1';
+			--------------------------------
+			WHEN IDHT1 =>									--load dada to FFT2D(subimage FFT)
+				if rst_fw = '1' THEN
+					rst_fw <= '0';
+				else	
+					if lc < K then
+						if lr < K then
+							blockr <= DHT_xr(i*K+lr,j*K+lc); 			-- load column data to FFT2D do the IFFT
+							blocki <= DHT_xi(i*K+lr,j*K+lc);				
+							lr := lr + 1;
+							
+							if lr = K then
+								lr := 0;
+								lc := lc +1;
+								if lc = K then
+									lc := 0;
+									state <= IDHT2;
+								end if;
+							end if;
+						end if;		
+					end if;
+				end if;
+			--------------------------------
+			when IDHT2 =>									-- calculate FFT2D
+				if fft2_valid = '1' then
+					if lc < K then	
+						if lr < K then     	-- if define a new variable, can pipelining. using "col" just used to simple
+							reg_IDHTr(i*K+lr,j*K+lc) <= reg_subout_r;
+							reg_IDHTi(i*K+lr,j*K+lc) <= reg_subout_i;
+							lr := lr+1;
+							
+							if lr = K then		-- one subblock IDHT is done,continue the next one
+								lr := 0;
+								lc := lc +1;
+								if lc = K then  -- All subblocks IDHT are done
+									state <= IDHT1;
+									lc := 0;
+									if i = 0 and j = 0 then		--the first sub image
+										j := j+1;
+									elsif i =0 and j = 1 then	--the second sub image
+										i := i + 1;
+										j := 0;
+									elsif i =1 and j =0 then	--the third sub image
+										j := j+1;
+									else									--the fourth sub image
+										i := 0; j := 0;
+										state <= overlap ;		-- To do the overlap
+										rst_fw <= '1';				-- stop tranform opertions
+										IDHT_sel <= '0';			
+									end if;
+								end if;
+							end if;
+						end if;
+					end if;
+				end if;			
+			
+			--------------------------------
+			WHEN overlap =>
+				
+			state <= done;
+
+			--------------------------------
+			WHEN done =>
+				DHTconv_valid <= '1';
+				--Covr_out <=
+				state <= start;
+		END CASE;
+	END IF;
+	
+	END PROCESS;
+	
+	-------------------- Mapping -------------------
+	FFT2D_valid: FFT2D PORT MAP(clk, rst_fw, blockr, blocki,IDHT_sel, fft2_valid, reg_subout_r, reg_subout_i);        --clk,rst,xr,xi, FFT2D_valid,fft2r,fft2i
+	--IFFT2D_valid:IFFT2D PORT MAP(clk, rst_bw,xr_in, xi_in, ifft2d_valid, fftr, ffti);
+					 
+
+end architecture;

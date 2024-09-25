@@ -1,0 +1,227 @@
+-------------------------------------------------------------------------------------
+-- Project Title : 2D FFT-based convolution
+-- Author        : Weiwei Wang
+-- Create Date   : 03/25/2024
+-- Description   : THis designe is 2D FFT based convolution 
+
+-- Filename      : FFT2D.vhd
+-- Description   : This file is using 1D FFT to calculate the 2D FFT (Sub image 
+--							fft for 2D DHT-based convolution. So it is a subblock of convo-
+--                   lution.)
+--                   In this desigen can be optimized using pipilining between diff-
+--                   erent states.
+-------------------------------------------------------------------------------------
+LIBRARY work;
+USE work.n_bits_int.ALL;
+
+LIBRARY ieee;   
+USE ieee.std_logic_1164.ALL; USE ieee.std_logic_arith.ALL; 
+USE ieee.std_logic_signed.ALL;USE ieee.std_logic_unsigned.ALL;
+
+package FFT2D_package is
+	Constant Lx :U9 := 16;
+	
+	type array_rc  is array (0 to Lx-1) of S20;--S16;
+	type array_x   is array (0 to Lx-1, 0 to Lx-1) of S20;--S16;
+	type array_out is array (0 to Lx-1, 0 to Lx-1) of S20;--S16;
+	type state_list is (start, load, Rfft1, Rfft2,Cfft1, Cfft2,output, done);
+	
+	component FFT
+		PORT (clk, rst_fft : IN STD_LOGIC;    -- Clock abd reset
+				xr_in, xi_in : IN S20;--S16;    -- Real and img. input
+				IDFT         : In std_logic;    -- Inverse DFT mark(0:DFT, 1:IDFT)
+				FFTblock     : out std_logic; 
+				add_o, mul_o : OUT S20;
+				fftr, ffti   : OUT S20--S16     -- Rel and img. output
+		); 
+	end component;
+
+end FFT2D_package;
+
+LIBRARY work;
+USE work.n_bits_int.ALL;
+
+LIBRARY work;
+USE work.FFT2D_package.ALL;
+
+LIBRARY ieee;   
+USE ieee.std_logic_1164.ALL; USE ieee.std_logic_arith.ALL; 
+USE ieee.std_logic_signed.ALL;USE ieee.std_logic_unsigned.ALL;
+
+entity FFT2D is
+	port(
+			clk:	   IN STD_LOGIC;				-- Clock cycle
+			rst_f2:  IN STD_LOGIC;				-- Reset
+			xr,xi:   In S20;--S16;				-- input x 
+			IDFT_sel:In STD_LOGIC;				-- FFT：row first then column,IFFT:column first then row 
+			FFT2D_valid: out std_logic;
+			add_2o,mul_2o: out S20;
+			fft2r,fft2i: out S20--S16
+	);
+end entity;
+
+architecture rtl of FFT2D is
+	signal state           : state_list;	-- State of system 
+	signal reg_xr, reg_xi  : array_x;		-- Reg for input x
+	signal reg_fft2r,reg_fft2i : array_out;-- reg for fft2d output
+	SIGNAL reg_subout_r, reg_subout_i: S20;--S16;   	-- Reg for row DHT or Column DHT
+	SIGNAL reset: STD_LOGIC;			      -- rst signal 
+	SIGNAL blockr, blocki: S20;--S16;		-- DADFTblock input
+	signal fft_valid: std_logic;      		-- FFTblock mark
+	signal add_1o, mul_1o: S20;
+	
+ begin 
+ 
+	process(clk, rst_f2)
+	   VARIABLE row, col: U9;
+		VARIABLE add_2total, mul_2total : S20;
+	begin
+		if rst_f2 = '1' then
+			reg_xr <= (others =>(others => 0));  		reg_xi <= (others =>(others => 0));
+			reg_fft2r <= (others =>(others => 0));    reg_fft2i <= (others =>(others => 0));
+			reset <= '1';
+			state <= start;
+		elsif rising_edge(clk) then
+			case state is
+				when start =>
+					row := 0; col := 0;
+					add_2total := 0;
+					mul_2total := 0;
+					FFT2D_valid <= '0';
+					state <= load;
+				---------------------------
+				when load =>
+					if row < Lx then
+						if col < Lx then
+							reg_xr(row,col) <= xr;
+							reg_xi(row,col) <= xi;
+							col := col+1;
+						else
+							col := 0;
+							row := row+1;
+						end if;
+					else 
+						row := 0;
+						state <= Rfft1;
+						reset <= '0';					
+					end if;
+				----------------------------
+				when Rfft1 =>						-- load the data to FFT 
+					if reset = '1' THEN
+					  reset <= '0';
+					else
+						if row < Lx then
+							if col < Lx then
+								blockr <= reg_xr(row,col);
+								blocki <= reg_xi(row,col);
+								col := col + 1;
+							else
+								state <= Rfft2;	-- After loading one row or column data,change state,so donot need delay a cycle again
+								col := 0;
+								row := row +1;
+							end if;
+							
+						else
+							row := 0;
+							state <= Rfft2;
+						end if;
+					end if;
+				----------------------------	
+				when Rfft2 =>							-- claculate FFT
+					if fft_valid = '1' then
+						if row < Lx+1 then	
+							if col < Lx then     	-- if define a new variable, can pipelining. using "col" just used to simple
+								reg_fft2r(row-1,col) <= reg_subout_r;
+								reg_fft2i(row-1,col) <= reg_subout_i;
+								col := col+1;
+								
+								if col = Lx then		-- one row FFT is done,continue the next row
+									col := 0;
+									add_2total := add_2total + add_1o;
+									mul_2total := mul_2total + mul_1o;
+									state <= Rfft1;
+									if row = Lx then  -- All rows' FFT are done
+										state <= Cfft1;
+										row := 0;
+									end if;
+								end if;
+							end if;
+						end if;
+					end if;
+				----------------------------
+				when Cfft1 =>							-- load column datat to IFFT
+					if reset = '1' THEN
+					  reset <= '0';
+					else	
+						if col < Lx then
+							if row < Lx then
+								blockr <= reg_fft2r(row,col);
+								blocki <= reg_fft2i(row,col);
+								row := row + 1;
+							else
+								state <= Cfft2;
+								row := 0;
+								col := col +1;
+							end if;
+						else		
+							col := 0;
+							state <= Cfft2;
+						end if;
+					end if;
+							
+				-------------------------------
+				when Cfft2 =>							-- calculate the column IFFT					
+					if fft_valid = '1' then
+						if col < Lx+1 then
+							if row < Lx then     	-- if define a new variable, can pipelining. using "col" just used to simple
+								reg_fft2r(row,col-1) <= reg_subout_r;
+								reg_fft2i(row,col-1) <= reg_subout_i;
+								row := row+1;
+								if row = Lx then
+									row := 0;
+									add_2total := add_2total + add_1o;
+									mul_2total := mul_2total + mul_1o;
+									state <= Cfft1;
+									if col = Lx then
+										state <= output;
+										col := 0;
+									end if;
+								end if;
+							end if;
+						end if;					
+					end if;	
+				-------------------------------
+				when output =>
+					FFT2D_valid <= '1';
+					add_2o <= add_2total;
+					mul_2o <= mul_2total;
+					if row < Lx then
+						if col < Lx then
+							fft2r <= reg_fft2r(row,col);
+							fft2i <= reg_fft2i(row,col);
+							col := col + 1;
+							if col = Lx then
+								col := 0;
+								row := row +1;
+							end if;
+							
+							if row = Lx then
+								row := 0;
+								state <= done;
+								reset <= '1';
+							end if;	
+						end if;	
+					end if;
+				----------------------------------
+				when done =>
+					FFT2D_valid <= '0';
+					state <= start;
+				-----------------------------------
+			end case;
+		end if;
+	end process;
+	
+	
+	FFTblock: FFT port map(clk,reset,blockr,blocki,IDFT_sel,fft_valid,add_1o, mul_1o,reg_subout_r,reg_subout_i);   -- Mapping
+		
+end architecture;
